@@ -14,6 +14,7 @@ from scipy.sparse.linalg import spsolve
 import matplotlib.pyplot as plt
 from PIL import Image
 import io
+import os
 
 class ThermalTopologyOptimization:
     def __init__(self, nelx, nely, volfrac, penal, rmin):
@@ -24,10 +25,90 @@ class ThermalTopologyOptimization:
         self.rmin = rmin
         self.x = volfrac * np.ones(nely*nelx)
         self.dc = np.zeros(nely*nelx)
-        self.ke = self.lk()
         self.iter = 0
+        self.ke = np.array([
+            [2/3, -1/6, -1/3, -1/6],
+            [-1/6, 2/3, -1/6, -1/3],
+            [-1/3, -1/6, 2/3, -1/6],
+            [-1/6, -1/3, -1/6, 2/3]
+        ])
 
-    # [Previous methods remain the same until optimize_with_animation]
+    def FE(self, x):
+        K = self.assemble_K(x)
+        F = self.load_vector()
+        K = K + diags(np.ones(K.shape[0]) * 1e-9)
+        try:
+            U = spsolve(K, F)
+        except:
+            st.warning("Solver failed, using approximate solution")
+            U = np.zeros_like(F)
+        return U
+
+    def assemble_K(self, x):
+        KE = self.ke
+        nDof = 2*(self.nelx+1)*(self.nely+1)
+        K = np.zeros((nDof, nDof))
+        
+        for ely in range(self.nely):
+            for elx in range(self.nelx):
+                n1 = (self.nely+1)*elx + ely
+                n2 = (self.nely+1)*(elx+1) + ely
+                edof = np.array([n1, n2, n2+1, n1+1])
+                ke = KE * (0.001 + 0.999*x[ely*self.nelx + elx]**self.penal)
+                for i in range(4):
+                    for j in range(4):
+                        K[edof[i], edof[j]] += ke[i,j]
+        return csc_matrix(K)
+
+    def load_vector(self):
+        F = np.zeros(2*(self.nelx+1)*(self.nely+1))
+        F[0] = 1.0
+        F[-1] = -1.0
+        return F
+
+    def compute_compliance(self, x, u):
+        ce = np.zeros(self.nely*self.nelx)
+        for ely in range(self.nely):
+            for elx in range(self.nelx):
+                n1 = (self.nely+1)*elx + ely
+                n2 = (self.nely+1)*(elx+1) + ely
+                edof = np.array([n1, n2, n2+1, n1+1])
+                Ue = u[edof]
+                ce[ely*self.nelx + elx] = np.dot(np.dot(Ue, self.ke), Ue)
+        return ce
+
+    def filter_sensitivity(self, dc):
+        filtered_dc = np.zeros_like(dc)
+        for i in range(self.nely):
+            for j in range(self.nelx):
+                sum_weight = 0.0
+                for k in range(max(0, i-int(self.rmin)), min(self.nely, i+int(self.rmin)+1)):
+                    for l in range(max(0, j-int(self.rmin)), min(self.nelx, j+int(self.rmin)+1)):
+                        fac = self.rmin - np.sqrt((i-k)**2 + (j-l)**2)
+                        if fac > 0:
+                            sum_weight += fac
+                            filtered_dc[i*self.nelx + j] += fac * dc[k*self.nelx + l]
+                filtered_dc[i*self.nelx + j] /= max(1e-3, sum_weight)
+        return filtered_dc
+
+    def OC(self, x, dc):
+        l1, l2 = 0, 1e9
+        move = 0.2
+        xnew = np.zeros(self.nelx*self.nely)
+        
+        while abs(l2-l1) > 1e-4:
+            lmid = 0.5*(l2+l1)
+            xnew = np.maximum(0.001, np.maximum(x-move, 
+                   np.minimum(1.0, np.minimum(x+move, 
+                   x*np.sqrt(np.maximum(1e-10, -dc/(lmid + 1e-10))))))
+            )
+            if np.sum(xnew) - self.volfrac*self.nelx*self.nely > 0:
+                l1 = lmid
+            else:
+                l2 = lmid
+            if l1 == l2:
+                break
+        return xnew
 
     def create_frame(self, x):
         fig, ax = plt.subplots(figsize=(10, 6))
@@ -40,7 +121,6 @@ class ThermalTopologyOptimization:
         ax.set_xlabel('X coordinate')
         ax.set_ylabel('Y coordinate')
         
-        # Convert plot to image
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight')
         plt.close(fig)
@@ -66,8 +146,6 @@ class ThermalTopologyOptimization:
             self.x = self.OC(self.x, dc)
             
             change = np.linalg.norm(self.x - xold)/np.linalg.norm(self.x)
-            
-            # Create and store frame
             frames.append(self.create_frame(self.x))
             progress_bar.progress(loop/maxiter)
             
@@ -101,10 +179,9 @@ def main():
         status.text('Optimizing...')
         frames = optimizer.optimize_with_frames(progress_bar)
         
-        # Save as GIF
-        gif_path = "optimization.gif"
+        temp_gif = "temp_optimization.gif"
         frames[0].save(
-            gif_path,
+            temp_gif,
             save_all=True,
             append_images=frames[1:],
             duration=200,
@@ -113,19 +190,21 @@ def main():
         
         status.text('Optimization complete!')
         
-        # Display final GIF
-        with open(gif_path, 'rb') as f:
+        with open(temp_gif, 'rb') as f:
             gif_bytes = f.read()
             
         st.image(gif_bytes, caption='Optimization Progress', use_column_width=True)
         
-        # Download button
         st.download_button(
             label="Download Animation",
             data=gif_bytes,
             file_name="topology_optimization.gif",
             mime="image/gif"
         )
+        
+        # Cleanup
+        if os.path.exists(temp_gif):
+            os.remove(temp_gif)
 
 if __name__ == "__main__":
     main()
